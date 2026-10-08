@@ -284,6 +284,7 @@ impl UserMessageContent {
             Self::Text(_) => Vec::new(),
             Self::Parts(parts) => parts
                 .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
                 .filter_map(|part| part.get("text").and_then(Value::as_str))
                 .filter(|text| !text.trim().is_empty())
                 .collect(),
@@ -3953,6 +3954,34 @@ mod tests {
         assert_eq!(
             request.extract_text_for_program_scheduling(),
             "user:Return W0_TANGERINE_4931"
+        );
+    }
+
+    #[test]
+    fn test_user_part_routing_ignores_non_text_parts() {
+        // A non-text part that happens to carry a top-level `text` field must not
+        // influence prefix-aware routing.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": "https://example.com/v.mp4"},
+                            "text": "should-be-ignored"
+                        },
+                        {"type": "text", "text": "real prompt"}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:real prompt"
         );
     }
 

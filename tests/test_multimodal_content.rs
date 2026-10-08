@@ -38,7 +38,7 @@ fn test_multimodal_user_parts_survive_roundtrip() {
         let parsed = parse_user_content(content.clone());
 
         assert!(
-            matches!(parsed, UserMessageContent::Parts(_)),
+            matches!(&parsed, UserMessageContent::Parts(_)),
             "expected Parts for {content}, got {parsed:?}"
         );
 
