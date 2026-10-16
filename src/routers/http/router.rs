@@ -80,6 +80,29 @@ fn emit_http_first_sse<E>(
     let _ = tx.send(Ok(bytes::Bytes::from(comment)));
 }
 
+/// Opt-in cap on a request's `top_k` (VLLM_ROUTER_MAX_TOP_K). Some backends
+/// sample on device only up to a fixed top-k and drop the whole batch to the
+/// host sampler for one request above it; capping keeps the batch on device.
+fn max_top_k() -> Option<i64> {
+    static MAX_TOP_K: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    *MAX_TOP_K.get_or_init(|| {
+        std::env::var("VLLM_ROUTER_MAX_TOP_K")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|&k| k > 0)
+    })
+}
+
+/// Lower `top_k` to `max` when it is larger. Unset, 0 and -1 are left as is.
+fn clamp_top_k(json: &mut serde_json::Value, max: i64) {
+    if let Some(top_k) = json.get_mut("top_k") {
+        if top_k.as_i64().is_some_and(|k| k > max) {
+            debug!(requested = %top_k, max, "clamping top_k");
+            *top_k = serde_json::Value::from(max);
+        }
+    }
+}
+
 struct LoadTrackedBody {
     inner: Pin<
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
@@ -1676,7 +1699,7 @@ impl Router {
                 };
 
                 // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
+                let mut json_val = match serde_json::to_value(typed_req) {
                     Ok(j) => j,
                     Err(e) => {
                         return (
@@ -1687,7 +1710,9 @@ impl Router {
                     }
                 };
 
-                // Use the original json_val without modification
+                if let Some(max) = max_top_k() {
+                    clamp_top_k(&mut json_val, max);
+                }
 
                 let request_url = format!("{}{}", worker_url_prefix, route);
                 (
@@ -1697,11 +1722,14 @@ impl Router {
                 )
             } else {
                 let request_url = format!("{}{}", worker_url, route);
-                (
-                    self.client.post(&request_url).json(typed_req),
-                    None,
-                    request_url,
-                )
+                let builder = match (max_top_k(), serde_json::to_value(typed_req)) {
+                    (Some(max), Ok(mut json_val)) => {
+                        clamp_top_k(&mut json_val, max);
+                        self.client.post(&request_url).json(&json_val)
+                    }
+                    _ => self.client.post(&request_url).json(typed_req),
+                };
+                (builder, None, request_url)
             };
 
         // Copy all headers from original request if provided, skipping
@@ -3133,6 +3161,24 @@ mod tests {
             assert_eq!(echoed["authorization"], "Bearer token");
         }
         server.abort();
+    }
+
+    #[test]
+    fn clamp_top_k_lowers_only_larger_values() {
+        let mut big = serde_json::json!({"top_k": 90, "temperature": 0.7});
+        clamp_top_k(&mut big, 32);
+        assert_eq!(big["top_k"], 32);
+        assert_eq!(big["temperature"], 0.7);
+
+        for k in [20, 32, 0, -1] {
+            let mut v = serde_json::json!({ "top_k": k });
+            clamp_top_k(&mut v, 32);
+            assert_eq!(v["top_k"], k);
+        }
+
+        let mut unset = serde_json::json!({"temperature": 1.0});
+        clamp_top_k(&mut unset, 32);
+        assert!(unset.get("top_k").is_none());
     }
 
     fn create_test_regular_router() -> Router {
