@@ -1140,13 +1140,6 @@ impl Router {
                         false
                     };
 
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
-
                 let response = self
                     .send_typed_request(
                         typed_req,
@@ -1171,17 +1164,8 @@ impl Router {
                     self.worker_registry.notify_worker_state_change();
                 }
 
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
+                // send_typed_request releases the load it was handed on every outcome
+                // (on body completion for streams), so retries need no cleanup here.
 
                 response
             },
@@ -1332,6 +1316,16 @@ impl Router {
             .await
     }
 
+    /// Release load taken for a request that ends before a response body exists.
+    fn release_load(&self, worker_url: &str, load_incremented: bool) {
+        if load_incremented {
+            if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                worker.decrement_load();
+                RouterMetrics::set_running_requests(worker_url, worker.load());
+            }
+        }
+    }
+
     // Send typed request directly without conversion
     #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
@@ -1353,6 +1347,7 @@ impl Router {
             // client routes as request errors so healthy workers are not
             // penalized by circuit-breaker accounting.
             if route != "/v1/chat/completions" {
+                self.release_load(worker_url, load_incremented);
                 return (
                     StatusCode::BAD_REQUEST,
                     format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
@@ -1360,6 +1355,7 @@ impl Router {
                     .into_response();
             }
             let Some(prepared) = prepared else {
+                self.release_load(worker_url, load_incremented);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "gRPC chat requires Frontend.prepare before dispatch",
@@ -1367,9 +1363,7 @@ impl Router {
                     .into_response();
             };
             let mut response = self.frontend.dispatch(worker_url, prepared).await;
-            if load_incremented
-                && (response.status().is_success() || !is_retryable_status(response.status()))
-            {
+            if load_incremented {
                 if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                     if is_stream && response.status().is_success() {
                         response = hold_load_until_body_done(response, worker);
@@ -1391,6 +1385,7 @@ impl Router {
                     Ok(tup) => tup,
                     Err(e) => {
                         error!("Failed to extract dp_rank: {}", e);
+                        self.release_load(worker_url, load_incremented);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("Failed to extract dp_rank: {}", e),
@@ -1403,6 +1398,7 @@ impl Router {
                 let json_val = match serde_json::to_value(typed_req) {
                     Ok(j) => j,
                     Err(e) => {
+                        self.release_load(worker_url, load_incremented);
                         return (
                             StatusCode::BAD_REQUEST,
                             format!("Convert into serde_json::Value failed: {}", e),
