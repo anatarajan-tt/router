@@ -12,8 +12,9 @@ use crate::program_scheduling::{
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
+    ChatCompletionRequest, ChatMessage, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    UserMessageContent,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -89,6 +90,66 @@ fn clamp_top_k(json: &mut serde_json::Value, max: i64) {
             *top_k = serde_json::Value::from(max);
         }
     }
+}
+
+/// Opt-in cap on images per chat request (VLLM_ROUTER_MAX_IMAGES). A backend
+/// that rejects extra images with 400 makes OpenRouter-style aggregators return
+/// the error to the user; answering 429 instead lets them try another provider.
+fn max_images() -> Option<usize> {
+    static MAX_IMAGES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MAX_IMAGES.get_or_init(|| {
+        std::env::var("VLLM_ROUTER_MAX_IMAGES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    })
+}
+
+fn is_image_part(part: &serde_json::Value) -> bool {
+    matches!(
+        part.get("type").and_then(serde_json::Value::as_str),
+        Some("image_url" | "image" | "input_image" | "image_pil" | "image_embeds")
+    )
+}
+
+fn count_image_parts_in_value(content: &serde_json::Value) -> usize {
+    content
+        .as_array()
+        .map_or(0, |parts| parts.iter().filter(|p| is_image_part(p)).count())
+}
+
+/// Image content parts across every message of a chat request.
+fn count_image_parts(messages: &[ChatMessage]) -> usize {
+    let in_content = |content: &UserMessageContent| match content {
+        UserMessageContent::Text(_) => 0,
+        UserMessageContent::Parts(parts) => parts.iter().filter(|p| is_image_part(p)).count(),
+    };
+    messages
+        .iter()
+        .map(|message| match message {
+            ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+                in_content(content)
+            }
+            ChatMessage::Assistant { content, .. } => content.as_ref().map_or(0, in_content),
+            ChatMessage::Tool { content, .. } => count_image_parts_in_value(content),
+            ChatMessage::Function { .. } => 0,
+            ChatMessage::Other(value) => value
+                .get("content")
+                .map_or(0, count_image_parts_in_value),
+        })
+        .sum()
+}
+
+fn too_many_images_response(count: usize, max: usize) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "This endpoint accepts at most {max} image(s) per request; got {count}."
+            ),
+            "type": "too_many_images",
+            "code": 429,
+        }
+    });
+    (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response()
 }
 
 struct LoadTrackedBody {
@@ -2250,6 +2311,13 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        if let Some(max) = max_images() {
+            let count = count_image_parts(&body.messages);
+            if count > max {
+                RouterMetrics::record_request_error("/v1/chat/completions", "too_many_images");
+                return too_many_images_response(count, max);
+            }
+        }
         self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
             .await
     }
@@ -2676,6 +2744,37 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn chat_messages(value: serde_json::Value) -> Vec<ChatMessage> {
+        serde_json::from_value(value).expect("messages")
+    }
+
+    #[test]
+    fn count_image_parts_across_roles() {
+        let messages = chat_messages(serde_json::json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "compare"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+                {"type": "image_url", "image_url": {"url": "https://x/y.png"}}
+            ]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "image_url", "image_url": {"url": "https://x/z.png"}}
+            ]},
+            {"role": "user", "content": [{"type": "video_url", "video_url": {"url": "v"}}]}
+        ]));
+        assert_eq!(count_image_parts(&messages), 3);
+
+        let text_only = chat_messages(serde_json::json!([{"role": "user", "content": "hi"}]));
+        assert_eq!(count_image_parts(&text_only), 0);
+    }
+
+    #[test]
+    fn too_many_images_is_429() {
+        let response = too_many_images_response(3, 1);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 
     #[test]
     fn clamp_top_k_lowers_only_larger_values() {
