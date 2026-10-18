@@ -93,6 +93,10 @@ pub fn init_metrics() {
         "vllm_router_sticky_prefix_total",
         "Imbalanced-load requests kept on the worker holding their long cached prefix"
     );
+    describe_counter!(
+        "vllm_router_sse_keepalives_total",
+        "SSE keep-alive comments sent during upstream silence"
+    );
     describe_gauge!("vllm_router_max_load", "Maximum worker load");
     describe_gauge!("vllm_router_min_load", "Minimum worker load");
 
@@ -609,6 +613,10 @@ impl RouterMetrics {
 
     pub fn record_sticky_prefix() {
         counter!("vllm_router_sticky_prefix_total").increment(1);
+    }
+
+    pub fn record_sse_keepalive() {
+        counter!("vllm_router_sse_keepalives_total").increment(1);
     }
 
     pub fn set_load_range(max_load: usize, min_load: usize) {

@@ -41,6 +41,54 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
+/// Opt-in SSE keep-alive: `VLLM_ROUTER_SSE_KEEPALIVE_SECS` (> 0 enables). While a
+/// successful stream is silent that long, the client gets an SSE comment line, so a
+/// long prefill does not look like a dead upstream to proxies with a first-byte
+/// timeout. SSE clients ignore comment lines.
+fn sse_keepalive_interval() -> Option<Duration> {
+    static INTERVAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        let secs = std::env::var("VLLM_ROUTER_SSE_KEEPALIVE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|&s| s > 0.0)?;
+        info!("SSE keep-alive enabled every {}s of upstream silence", secs);
+        Some(Duration::from_secs_f64(secs))
+    })
+}
+
+const SSE_KEEPALIVE: &[u8] = b": keep-alive\n\n";
+
+/// Next upstream chunk. With `every` set, each `every` of upstream silence sends an
+/// SSE comment to the client, but only at an event boundary (`at_boundary`) so it
+/// never splits an event. Returns None when the upstream ends or the client is gone
+/// (check `tx.is_closed()`).
+async fn next_chunk_with_keepalive<S: futures_util::Stream + Unpin>(
+    stream: &mut S,
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, String>>,
+    every: Option<Duration>,
+    at_boundary: bool,
+) -> Option<S::Item> {
+    let Some(every) = every else {
+        return stream.next().await;
+    };
+    loop {
+        match tokio::time::timeout(every, stream.next()).await {
+            Ok(next) => return next,
+            Err(_) if at_boundary => {
+                if tx
+                    .send(Ok(bytes::Bytes::from_static(SSE_KEEPALIVE)))
+                    .is_err()
+                {
+                    return None;
+                }
+                RouterMetrics::record_sse_keepalive();
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
         headers.insert("x-router-stages", value);
@@ -1653,9 +1701,14 @@ impl Router {
                 let mut decremented = false;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                let keepalive = status.is_success().then(sse_keepalive_interval).flatten();
+                let mut at_boundary = true;
+                while let Some(chunk) =
+                    next_chunk_with_keepalive(&mut stream, &tx, keepalive, at_boundary).await
+                {
                     match chunk {
                         Ok(bytes) => {
+                            at_boundary = bytes.ends_with(b"\n\n");
                             if first_sse {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -1690,6 +1743,9 @@ impl Router {
                             break;
                         }
                     }
+                }
+                if tx.is_closed() {
+                    stream_succeeded = false;
                 }
                 if !decremented {
                     if let Some(worker) = registry.get_by_url(&worker_url) {
@@ -1733,9 +1789,14 @@ impl Router {
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                let keepalive = status.is_success().then(sse_keepalive_interval).flatten();
+                let mut at_boundary = true;
+                while let Some(chunk) =
+                    next_chunk_with_keepalive(&mut stream, &tx, keepalive, at_boundary).await
+                {
                     match chunk {
                         Ok(bytes) => {
+                            at_boundary = bytes.ends_with(b"\n\n");
                             if first_sse {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -1758,6 +1819,9 @@ impl Router {
                             break;
                         }
                     }
+                }
+                if tx.is_closed() {
+                    stream_succeeded = false;
                 }
                 if let Some(completion) = &completion {
                     completion.finish(stream_succeeded);
@@ -2744,6 +2808,47 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn keepalive_fills_silence_only_at_event_boundaries() {
+        let (up_tx, up_rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
+        let mut upstream = UnboundedReceiverStream::new(up_rx);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let every = Some(Duration::from_millis(60));
+
+        // 150 ms of silence at a boundary: two comments, then the chunk.
+        let feeder = up_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = feeder.send(Ok(bytes::Bytes::from_static(b"data: {}\n\n")));
+        });
+        let chunk = next_chunk_with_keepalive(&mut upstream, &tx, every, true).await;
+        assert_eq!(chunk.unwrap().unwrap().as_ref(), b"data: {}\n\n");
+        assert_eq!(rx.try_recv().unwrap().unwrap().as_ref(), SSE_KEEPALIVE);
+        assert_eq!(rx.try_recv().unwrap().unwrap().as_ref(), SSE_KEEPALIVE);
+        assert!(rx.try_recv().is_err());
+
+        // Mid-event silence: nothing injected.
+        let feeder = up_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = feeder.send(Ok(bytes::Bytes::from_static(b"}\n\n")));
+        });
+        let chunk = next_chunk_with_keepalive(&mut upstream, &tx, every, false).await;
+        assert_eq!(chunk.unwrap().unwrap().as_ref(), b"}\n\n");
+        assert!(rx.try_recv().is_err());
+
+        // Disabled: plain passthrough.
+        up_tx.send(Ok(bytes::Bytes::from_static(b"x"))).unwrap();
+        let chunk = next_chunk_with_keepalive(&mut upstream, &tx, None, true).await;
+        assert_eq!(chunk.unwrap().unwrap().as_ref(), b"x");
+
+        // Client gone: stop waiting.
+        drop(rx);
+        let chunk = next_chunk_with_keepalive(&mut upstream, &tx, every, true).await;
+        assert!(chunk.is_none());
+        assert!(tx.is_closed());
+    }
 
     fn chat_messages(value: serde_json::Value) -> Vec<ChatMessage> {
         serde_json::from_value(value).expect("messages")
