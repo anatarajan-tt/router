@@ -72,6 +72,36 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, info};
 
+/// Opt-in prefix stickiness under imbalance, read once from the environment:
+/// `VLLM_ROUTER_STICKY_MIN_PREFIX_CHARS` (> 0 enables) and `VLLM_ROUTER_STICKY_LOAD_SLACK`
+/// (default 16). When the system is imbalanced, a request whose cached prefix is at least
+/// `min_chars` long stays on the worker holding it unless that worker's load exceeds the
+/// minimum load by more than `slack`. Re-prefilling a long prefix on another worker costs
+/// far more than a few extra requests in a queue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StickyPrefix {
+    min_chars: usize,
+    slack: usize,
+}
+
+fn sticky_prefix() -> Option<StickyPrefix> {
+    static STICKY: std::sync::OnceLock<Option<StickyPrefix>> = std::sync::OnceLock::new();
+    *STICKY.get_or_init(|| {
+        let read = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        };
+        let min_chars = read("VLLM_ROUTER_STICKY_MIN_PREFIX_CHARS").filter(|&n| n > 0)?;
+        let slack = read("VLLM_ROUTER_STICKY_LOAD_SLACK").unwrap_or(16);
+        info!(
+            "cache_aware: sticky long prefixes enabled (min_chars={}, load_slack={})",
+            min_chars, slack
+        );
+        Some(StickyPrefix { min_chars, slack })
+    })
+}
+
 /// Backend candidate for a side-effect-free cache-affinity query.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheAwareCandidate<'a> {
@@ -239,6 +269,46 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Under imbalance, keep a request on the worker that holds its long cached prefix if
+    /// that worker is within `sticky.slack` of the minimum load.
+    fn select_worker_sticky_prefix(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        model_id: &str,
+        min_load: usize,
+        sticky: StickyPrefix,
+    ) -> Option<usize> {
+        let text = request_text?;
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone())?;
+        let result = tree.prefix_match_with_counts(text);
+        if result.matched_char_count < sticky.min_chars {
+            return None;
+        }
+        let tenant_url: &str = &result.tenant;
+        let idx = workers
+            .iter()
+            .position(|w| w.url() == tenant_url)
+            .filter(|&idx| workers[idx].is_healthy())?;
+        if workers[idx].load() > min_load + sticky.slack {
+            return None;
+        }
+
+        debug!(
+            "Sticky prefix: {} matched chars on {} (load {}, min {})",
+            result.matched_char_count,
+            tenant_url,
+            workers[idx].load(),
+            min_load
+        );
+        tree.insert(text, workers[idx].url());
+        workers[idx].increment_processed();
+        RouterMetrics::record_sticky_prefix();
+        RouterMetrics::record_processed_request(workers[idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
+        Some(idx)
+    }
+
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -327,6 +397,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         );
 
         if is_imbalanced {
+            if let Some(sticky) = sticky_prefix() {
+                if let Some(idx) = self.select_worker_sticky_prefix(
+                    workers,
+                    request_text,
+                    model_id,
+                    min_load,
+                    sticky,
+                ) {
+                    return Some(idx);
+                }
+            }
             return self.select_worker_min_load(
                 workers,
                 request_text,
@@ -608,6 +689,55 @@ mod tests {
             let idx = policy.select_worker(&workers, Some("test")).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    #[test]
+    fn sticky_prefix_keeps_long_prefix_within_slack() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
+        policy.init_workers(&workers);
+
+        // A long conversation lands on w1 while load is balanced.
+        let history = "x".repeat(1000);
+        let first = policy.select_worker(&workers, Some(&history)).unwrap();
+        let model_id = normalize_model_key(workers[0].model_id());
+        let next_turn = format!("{history} next turn");
+        let sticky = StickyPrefix {
+            min_chars: 500,
+            slack: 16,
+        };
+
+        // Within slack: stays on the worker holding the prefix.
+        for _ in 0..10 {
+            workers[first].increment_load();
+        }
+        assert_eq!(
+            policy.select_worker_sticky_prefix(&workers, Some(&next_turn), model_id, 0, sticky),
+            Some(first)
+        );
+
+        // Short prefix: not sticky.
+        assert_eq!(
+            policy.select_worker_sticky_prefix(&workers, Some("xx"), model_id, 0, sticky),
+            None
+        );
+
+        // Beyond slack: spill.
+        for _ in 0..10 {
+            workers[first].increment_load();
+        }
+        assert_eq!(
+            policy.select_worker_sticky_prefix(&workers, Some(&next_turn), model_id, 0, sticky),
+            None
+        );
     }
 
     #[test]
