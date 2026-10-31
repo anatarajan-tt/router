@@ -103,6 +103,65 @@ fn clamp_top_k(json: &mut serde_json::Value, max: i64) {
     }
 }
 
+/// Opt-in list of top-level body fields the router removes from chat and
+/// completion requests before forwarding (VLLM_ROUTER_STRIP_PARAMS, comma
+/// separated, e.g. `seed`). A seeded row makes Tenstorrent vLLM backends verify
+/// MTP drafts on the host for its whole rank; stripping `seed` keeps the batch
+/// on device.
+fn strip_params() -> &'static [String] {
+    static STRIP_PARAMS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    STRIP_PARAMS.get_or_init(|| {
+        parse_strip_params(std::env::var("VLLM_ROUTER_STRIP_PARAMS").ok().as_deref())
+    })
+}
+
+fn parse_strip_params(raw: Option<&str>) -> Vec<String> {
+    let mut fields: Vec<String> = raw
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(str::to_owned)
+        .collect();
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+fn strips_route(route: &str) -> bool {
+    matches!(route, "/v1/chat/completions" | "/v1/completions")
+}
+
+/// Remove `fields` from the top level of a request body. Returns the number removed.
+fn strip_fields(json: &mut serde_json::Value, fields: &[String]) -> usize {
+    let Some(obj) = json.as_object_mut() else {
+        return 0;
+    };
+    let mut removed = 0;
+    for field in fields {
+        if obj.remove(field).is_some() {
+            debug!(field = %field, "stripping request field");
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Body rewrites applied before an HTTP request is forwarded to a worker.
+fn rewrite_body(json: &mut serde_json::Value, route: &str) {
+    if let Some(max) = max_top_k() {
+        clamp_top_k(json, max);
+    }
+    let fields = strip_params();
+    if !fields.is_empty() && strips_route(route) {
+        strip_fields(json, fields);
+    }
+}
+
+fn needs_body_rewrite(route: &str) -> bool {
+    max_top_k().is_some() || (!strip_params().is_empty() && strips_route(route))
+}
+
 /// Opt-in cap on images per chat request (VLLM_ROUTER_MAX_IMAGES). A backend
 /// that rejects extra images with 400 makes OpenRouter-style aggregators return
 /// the error to the user; answering 429 instead lets them try another provider.
@@ -1770,9 +1829,7 @@ impl Router {
                     }
                 };
 
-                if let Some(max) = max_top_k() {
-                    clamp_top_k(&mut json_val, max);
-                }
+                rewrite_body(&mut json_val, route);
 
                 let request_url = format!("{}{}", worker_url_prefix, route);
                 (
@@ -1782,12 +1839,15 @@ impl Router {
                 )
             } else {
                 let request_url = format!("{}{}", worker_url, route);
-                let builder = match (max_top_k(), serde_json::to_value(typed_req)) {
-                    (Some(max), Ok(mut json_val)) => {
-                        clamp_top_k(&mut json_val, max);
+                let rewritten = needs_body_rewrite(route)
+                    .then(|| serde_json::to_value(typed_req).ok())
+                    .flatten();
+                let builder = match rewritten {
+                    Some(mut json_val) => {
+                        rewrite_body(&mut json_val, route);
                         self.client.post(&request_url).json(&json_val)
                     }
-                    _ => self.client.post(&request_url).json(typed_req),
+                    None => self.client.post(&request_url).json(typed_req),
                 };
                 (builder, None, request_url)
             };
@@ -3277,6 +3337,92 @@ mod tests {
         let mut unset = serde_json::json!({"temperature": 1.0});
         clamp_top_k(&mut unset, 32);
         assert!(unset.get("top_k").is_none());
+    }
+
+    #[test]
+    fn parse_strip_params_trims_and_dedups() {
+        assert!(parse_strip_params(None).is_empty());
+        assert!(parse_strip_params(Some("")).is_empty());
+        assert!(parse_strip_params(Some(" , ,")).is_empty());
+        assert_eq!(parse_strip_params(Some("seed")), vec!["seed"]);
+        assert_eq!(
+            parse_strip_params(Some(" seed, logit_bias ,seed,")),
+            vec!["logit_bias", "seed"]
+        );
+    }
+
+    #[test]
+    fn strip_fields_removes_only_listed_top_level_fields() {
+        let fields = parse_strip_params(Some("seed"));
+        let mut body = serde_json::json!({
+            "model": "m",
+            "seed": 1234,
+            "temperature": 0.7,
+            "messages": [{"role": "user", "content": "hi", "seed": 5}],
+            "extra_body": {"seed": 9}
+        });
+        assert_eq!(strip_fields(&mut body, &fields), 1);
+        assert!(body.get("seed").is_none());
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["messages"][0]["seed"], 5);
+        assert_eq!(body["extra_body"]["seed"], 9);
+
+        let mut unseeded = serde_json::json!({"model": "m", "temperature": 1.0});
+        let before = unseeded.clone();
+        assert_eq!(strip_fields(&mut unseeded, &fields), 0);
+        assert_eq!(unseeded, before);
+
+        let mut null_seed = serde_json::json!({"seed": null});
+        assert_eq!(strip_fields(&mut null_seed, &fields), 1);
+        assert!(null_seed.as_object().unwrap().is_empty());
+
+        let mut not_object = serde_json::json!([1, 2]);
+        assert_eq!(strip_fields(&mut not_object, &fields), 0);
+
+        assert_eq!(strip_fields(&mut body, &[]), 0);
+    }
+
+    #[test]
+    fn strip_fields_handles_typed_chat_and_completion_requests() {
+        let fields = parse_strip_params(Some("seed"));
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": 42,
+            "temperature": 0.5
+        }))
+        .unwrap();
+        let mut json = serde_json::to_value(&chat).unwrap();
+        assert_eq!(json["seed"], 42);
+        strip_fields(&mut json, &fields);
+        assert!(json.get("seed").is_none());
+        assert_eq!(json["temperature"], 0.5);
+
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "hi",
+            "seed": 7
+        }))
+        .unwrap();
+        let mut json = serde_json::to_value(&completion).unwrap();
+        assert_eq!(json["seed"], 7);
+        strip_fields(&mut json, &fields);
+        assert!(json.get("seed").is_none());
+        assert_eq!(json["prompt"], "hi");
+    }
+
+    #[test]
+    fn strips_route_covers_chat_and_completions_only() {
+        assert!(strips_route("/v1/chat/completions"));
+        assert!(strips_route("/v1/completions"));
+        for route in [
+            "/v1/responses",
+            "/v1/embeddings",
+            "/generate",
+            "/inference/v1/generate",
+        ] {
+            assert!(!strips_route(route), "{route}");
+        }
     }
 
     fn create_test_regular_router() -> Router {
