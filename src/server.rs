@@ -252,11 +252,28 @@ async fn inference_generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    Json(mut raw): Json<serde_json::Value>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
+    if crate::routers::http::chat_normalize::enabled() {
+        crate::routers::http::chat_normalize::normalize_chat_body(&mut raw);
+    }
+    let body: ChatCompletionRequest = match serde_json::from_value(raw) {
+        Ok(body) => body,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {
+                    "message": format!("Invalid chat completion request: {err}"),
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }})),
+            )
+                .into_response();
+        }
+    };
 
     state.router.route_chat(Some(&headers), &body, None).await
 }

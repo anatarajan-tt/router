@@ -1,5 +1,6 @@
 //! HTTP router implementations
 
+pub mod chat_normalize;
 pub mod dp_utils;
 mod epd;
 pub mod logprobs_merge;
