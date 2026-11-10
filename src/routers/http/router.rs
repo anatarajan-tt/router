@@ -2629,10 +2629,13 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        let count = count_image_parts(&body.messages);
+        let rejected = max_images().is_some_and(|max| count > max);
+        RouterMetrics::record_chat_images(count, rejected);
         if let Some(max) = max_images() {
-            let count = count_image_parts(&body.messages);
             if count > max {
                 RouterMetrics::record_request_error("/v1/chat/completions", "too_many_images");
+                info!(images = count, max_images = max, "rejecting chat request: too many images");
                 return too_many_images_response(count, max);
             }
         }

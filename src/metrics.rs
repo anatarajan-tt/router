@@ -528,6 +528,21 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    /// Chat requests by number of image parts (bucketed) and whether the image cap rejected them.
+    pub fn record_chat_images(count: usize, rejected: bool) {
+        let bucket = match count {
+            0..=4 => count.to_string(),
+            5..=8 => "5-8".to_string(),
+            9..=16 => "9-16".to_string(),
+            _ => "17+".to_string(),
+        };
+        counter!("vllm_router_chat_images_total",
+            "images" => bucket,
+            "outcome" => if rejected { "rejected" } else { "accepted" }
+        )
+        .increment(1);
+    }
+
     pub fn record_retry(route: &str) {
         counter!("vllm_router_retries_total",
             "route" => route.to_string()
